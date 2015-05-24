@@ -1,0 +1,322 @@
+---
+title: "Practical Machine Learning - Activity Classification"
+author: "John Bejarano"
+date: "Tuesday, May 19, 2015"
+output: html_document
+---
+
+In this article, I will be producing a machine-learning model that will accurately predict the quality of particular weight lifting exercises that were performed while monitored with body motion sensors.  This effort is part of the Practical Maching Learning course offered by the Johns Hopkins University Bloomberg School of Public Health through Coursera.
+
+Six subjects conducted these weight lifting exercises either correctly or with one of four specific defects as directed by the team conducting the study.  From the study's website, these exercise qualities or "classes" are defined as follows:
+
+Exactly according to the specification (Class A), throwing the elbows to the front (B), lifting the dumbbell only halfway (C), lowering the dumbbell only halfway (D) and throwing the hips to the front (E).
+
+The task at hand is to take body motion sensor readings and predict which class of exercise quality is being performed.  My thanks to the provider's of this data.  The full study's accreditation and website are as follows:
+
+Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. Qualitative Activity Recognition of Weight Lifting Exercises. Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13) . Stuttgart, Germany: ACM SIGCHI, 2013.
+
+Read more: http://groupware.les.inf.puc-rio.br/har#weight_lifting_exercises
+
+To begin with, I need to read in and clean our training and test sets.  As part of the course project, the training and test sets have been pre-divided into their own files as indicated in the code below.
+
+```{r}
+library(caret)
+library(ggplot2)
+library(randomForest)
+set.seed(8)
+setwd("H:\\Data Science\\course8project")
+pmltrainingraw <- read.csv("pml-training.csv", na.strings = c("#DIV/0!", "", "NA"))
+
+pmltestingraw <- read.csv("pml-testing.csv")
+
+#seek out columns with no data, very sparse data, and non-metric data.
+countna <- function(x) sum(is.na(x))
+colnacount <- apply(pmltrainingraw, 2, countna)
+badcols <- c(1, 2, 3, 4, 5, 6, 7, which(colnacount > 0))
+
+#Exclude these columns from the training and test sets.
+pmltraining <- pmltrainingraw[, -badcols]
+pmltesting <- pmltestingraw[, -badcols]
+
+predictors <- 1:(length(pmltraining) - 1)
+
+#turn factors into numeric data for both training and testing data.
+pmltrainingclean <- pmltraining
+for (i in 1:52) {
+     pmltrainingclean[,i] <- as.numeric(pmltraining[,i])
+}
+
+pmltestingclean <- pmltesting
+for (i in 1:52) {
+     pmltestingclean[,i] <- as.numeric(pmltesting[,i])
+}
+```
+
+I'll also see if we have any columns of data with very little variance.  If there are any, I would eliminate those columns as well as they would not be helpful in predicting anything.
+
+```{r}
+#seek out columns with no variance
+colnovar <- nearZeroVar(pmltrainingclean)
+colnovar
+```
+
+No columns with negligible variance, so no further column pruning is necessary here.
+
+Next, I'd like to perform my own cross-validation on the training set.  In order to get a good out-of-sample error rate estimate, I'll produce 10-fold cross-validation sets each of which will include 90% of the training set and put the other 10% in a cross-validation test set.  I'll train models on each of the cross-validation training sets and test their accuracy on their respective cross-validation test sets.  I'll then average their accuracies to get my out-of-sample error rate estimate.
+
+```{r}
+#create 10-fold sets for cross-validation
+pmltrainingfolds <- createFolds(y = pmltrainingclean$classe, k = 10, list = TRUE, returnTrain = TRUE)
+
+#create ten cross-validation training sets based on the folds.
+pmltraining01 <- pmltrainingclean[pmltrainingfolds$Fold01,]
+pmltraining02 <- pmltrainingclean[pmltrainingfolds$Fold02,]
+#...and so on for the other folds.
+```
+
+For brevity's sake, I won't echo the code for folds 03 through 10, but it's the same as for the first two.  Please see the original R markdown file for the rest of that code.
+
+```{r, echo=FALSE}
+pmltraining03 <- pmltrainingclean[pmltrainingfolds$Fold03,]
+pmltraining04 <- pmltrainingclean[pmltrainingfolds$Fold04,]
+pmltraining05 <- pmltrainingclean[pmltrainingfolds$Fold05,]
+pmltraining06 <- pmltrainingclean[pmltrainingfolds$Fold06,]
+pmltraining07 <- pmltrainingclean[pmltrainingfolds$Fold07,]
+pmltraining08 <- pmltrainingclean[pmltrainingfolds$Fold08,]
+pmltraining09 <- pmltrainingclean[pmltrainingfolds$Fold09,]
+pmltraining10 <- pmltrainingclean[pmltrainingfolds$Fold10,]
+```
+
+```{r}
+#create ten cross-validation testing sets based on the folds.
+pmlcvtesting01 <- pmltrainingclean[-pmltrainingfolds$Fold01,]
+pmlcvtesting02 <- pmltrainingclean[-pmltrainingfolds$Fold02,]
+#...and so on for the other folds.
+```
+
+```{r, echo = FALSE}
+pmlcvtesting03 <- pmltrainingclean[-pmltrainingfolds$Fold03,]
+pmlcvtesting04 <- pmltrainingclean[-pmltrainingfolds$Fold04,]
+pmlcvtesting05 <- pmltrainingclean[-pmltrainingfolds$Fold05,]
+pmlcvtesting06 <- pmltrainingclean[-pmltrainingfolds$Fold06,]
+pmlcvtesting07 <- pmltrainingclean[-pmltrainingfolds$Fold07,]
+pmlcvtesting08 <- pmltrainingclean[-pmltrainingfolds$Fold08,]
+pmlcvtesting09 <- pmltrainingclean[-pmltrainingfolds$Fold09,]
+pmlcvtesting10 <- pmltrainingclean[-pmltrainingfolds$Fold10,]
+```
+
+Before we can train any models, we need to impute any missing values in our predictor columns, and then standardize their values.  I will use the `knnImpute` preProcessing method in the `caret` package for this.  It utilizes a k-nearest-neighbor algorithm to impute any missing values, and then changes each value to its respective z-score (i.e. subtracts the column's mean and divides by the column's standard deviation).  I'll perform this impuation and standardization on each cross-validation training set, and then once for the training set as a whole.
+
+```{r}
+#impute and standardize values using caret's knnImpute for each fold and for the whole training set.
+impobj01 <- preProcess(pmltraining01[,predictors], method = c("knnImpute"))
+impobj02 <- preProcess(pmltraining02[,predictors], method = c("knnImpute"))
+#...and so on for the other folds.
+```
+
+```{r, echo=FALSE}
+impobj03 <- preProcess(pmltraining03[,predictors], method = c("knnImpute"))
+impobj04 <- preProcess(pmltraining04[,predictors], method = c("knnImpute"))
+impobj05 <- preProcess(pmltraining05[,predictors], method = c("knnImpute"))
+impobj06 <- preProcess(pmltraining06[,predictors], method = c("knnImpute"))
+impobj07 <- preProcess(pmltraining07[,predictors], method = c("knnImpute"))
+impobj08 <- preProcess(pmltraining08[,predictors], method = c("knnImpute"))
+impobj09 <- preProcess(pmltraining09[,predictors], method = c("knnImpute"))
+impobj10 <- preProcess(pmltraining10[,predictors], method = c("knnImpute"))
+```
+
+```{r}
+impobj <- preProcess(pmltrainingclean[,predictors], method = c("knnImpute"))
+```
+
+```{r}
+pmltraining01[,predictors] <- predict(impobj01, pmltraining01[,predictors])
+pmltraining02[,predictors] <- predict(impobj02, pmltraining02[,predictors])
+#...and so on for the other folds.
+```
+
+```{r, echo=FALSE}
+pmltraining03[,predictors] <- predict(impobj03, pmltraining03[,predictors])
+pmltraining04[,predictors] <- predict(impobj04, pmltraining04[,predictors])
+pmltraining05[,predictors] <- predict(impobj05, pmltraining05[,predictors])
+pmltraining06[,predictors] <- predict(impobj06, pmltraining06[,predictors])
+pmltraining07[,predictors] <- predict(impobj07, pmltraining07[,predictors])
+pmltraining08[,predictors] <- predict(impobj08, pmltraining08[,predictors])
+pmltraining09[,predictors] <- predict(impobj09, pmltraining09[,predictors])
+pmltraining10[,predictors] <- predict(impobj10, pmltraining10[,predictors])
+```
+
+```{r}
+pmltrainingclean[,predictors] <- predict(impobj, pmltrainingclean[,predictors])
+```
+
+Now that I have imputation and standardization parameters based on the training sets (both the cross-validation sets and the main training set), I will use these same parameters to transform the cross-validation test sets and the main test set with the respective parameters from their respective training sets.
+
+
+```{r}
+#apply the training sets' pre-processing to each cross-validation test set.
+pmlcvtesting01[,predictors] <- predict(impobj01, pmlcvtesting01[,predictors])
+pmlcvtesting02[,predictors] <- predict(impobj02, pmlcvtesting02[,predictors])
+#...and so on for the other folds.
+```
+
+```{r, echo=FALSE}
+pmlcvtesting03[,predictors] <- predict(impobj03, pmlcvtesting03[,predictors])
+pmlcvtesting04[,predictors] <- predict(impobj04, pmlcvtesting04[,predictors])
+pmlcvtesting05[,predictors] <- predict(impobj05, pmlcvtesting05[,predictors])
+pmlcvtesting06[,predictors] <- predict(impobj06, pmlcvtesting06[,predictors])
+pmlcvtesting07[,predictors] <- predict(impobj07, pmlcvtesting07[,predictors])
+pmlcvtesting08[,predictors] <- predict(impobj08, pmlcvtesting08[,predictors])
+pmlcvtesting09[,predictors] <- predict(impobj09, pmlcvtesting09[,predictors])
+pmlcvtesting10[,predictors] <- predict(impobj10, pmlcvtesting10[,predictors])
+```
+
+```{r}
+#apply the training sets' pre-processing to the main test set.
+pmltestingclean[,predictors] <- predict(impobj, pmltestingclean[,predictors])
+```
+
+Now comes the time to train a model.  I will use the random forest algorithm to perform the predictions.  I chose this algorithm for two reasons:  A) It's an algorithm very well suited to classification, and B) while the random forest algorithm sacrafices some interpretability, it delivers high-accuracy predictions.  We'll determine how accurate we feel the model will be by looking at how accurate the cross-validation models are with their respective test sets.  The class that we are trying to predict is stored in a column called `classe`.
+
+Other models I considered were boosted or `gbm` models and generalized linear or `glm` models with logistic regression to predict each of the five classes.  As we'll see below, our results from the random forest algorithm obviated the need for these other models, but these are other avenues that were under consideration as alternatives had random forests proved to be ineffective.
+
+I had hoped to use the `caret` package directly to train the random forest models, however, the performance of training a model through caret's `train` function is simply too slow.  In the interests of performance, I am making direct calls to `randomForest`.
+
+I will develop a model for each of the ten cross-validation sets and one for the full set that will be our final model to predict the real test set.
+
+```{r}
+#train a random forest model on standardized data for each fold and the whole training set.
+pmlrfmodel01 <- randomForest(classe ~ ., data = pmltraining01)
+pmlrfmodel02 <- randomForest(classe ~ ., data = pmltraining02)
+#...and so on for the other folds.
+```
+
+```{r, echo=FALSE}
+pmlrfmodel03 <- randomForest(classe ~ ., data = pmltraining03)
+pmlrfmodel04 <- randomForest(classe ~ ., data = pmltraining04)
+pmlrfmodel05 <- randomForest(classe ~ ., data = pmltraining05)
+pmlrfmodel06 <- randomForest(classe ~ ., data = pmltraining06)
+pmlrfmodel07 <- randomForest(classe ~ ., data = pmltraining07)
+pmlrfmodel08 <- randomForest(classe ~ ., data = pmltraining08)
+pmlrfmodel09 <- randomForest(classe ~ ., data = pmltraining09)
+pmlrfmodel10 <- randomForest(classe ~ ., data = pmltraining10)
+```
+
+```{r}
+pmlrfmodel <- randomForest(classe ~ ., data = pmltrainingclean)
+```
+
+Now that we have trained models, let's see how each of the ten random forest models we trained on our cross-validation training set folds perform on their respective test sets.  
+
+```{r}
+#get predictions from the models on their cross-validation testing sets.
+pmlcvtestpred01 <- predict(pmlrfmodel01,pmlcvtesting01)
+pmlcvtestpred02 <- predict(pmlrfmodel02,pmlcvtesting02)
+#...and so on for the other folds.
+```
+
+```{r, echo=FALSE}
+pmlcvtestpred03 <- predict(pmlrfmodel03,pmlcvtesting03)
+pmlcvtestpred04 <- predict(pmlrfmodel04,pmlcvtesting04)
+pmlcvtestpred05 <- predict(pmlrfmodel05,pmlcvtesting05)
+pmlcvtestpred06 <- predict(pmlrfmodel06,pmlcvtesting06)
+pmlcvtestpred07 <- predict(pmlrfmodel07,pmlcvtesting07)
+pmlcvtestpred08 <- predict(pmlrfmodel08,pmlcvtesting08)
+pmlcvtestpred09 <- predict(pmlrfmodel09,pmlcvtesting09)
+pmlcvtestpred10 <- predict(pmlrfmodel10,pmlcvtesting10)
+```
+
+```{r}
+#see out-of-bag error rate estimates from cross-validation models.
+cvoobrates <- c(mean(pmlcvtestpred01 == pmlcvtesting01$classe),
+                mean(pmlcvtestpred02 == pmlcvtesting02$classe),
+                mean(pmlcvtestpred03 == pmlcvtesting03$classe),
+                mean(pmlcvtestpred04 == pmlcvtesting04$classe),
+                mean(pmlcvtestpred05 == pmlcvtesting05$classe),
+                mean(pmlcvtestpred06 == pmlcvtesting06$classe),
+                mean(pmlcvtestpred07 == pmlcvtesting07$classe),
+                mean(pmlcvtestpred08 == pmlcvtesting08$classe),
+                mean(pmlcvtestpred09 == pmlcvtesting09$classe),
+                mean(pmlcvtestpred10 == pmlcvtesting10$classe))
+
+cvoobrates
+
+mean(cvoobrates)
+```
+
+The average out-of-sample accuracy rate from our 10-fold cross-validation yields an accuracy estimate of over 99%.  This is encouraging.
+
+As a sanity check, I will have the main model predict the rows of the main training set upon which it is based.
+
+```{r}
+#get predictions on the entire training set from the model.
+pmltrainpred <- predict(pmlrfmodel, pmltrainingclean)
+
+confusionMatrix(pmltrainpred, pmltrainingclean$classe)
+```
+
+We would expect the predictions on the training set to be highly accurate because, of course, this is the data that originally produced the model.  The predictions do, indeed, prove to be that accurate.
+
+Now, is the moment of truth.  How will the model predict the class of the twenty observations in the main test set?
+
+```{r}
+#get predictions on the real test set.
+pmltestpred <- predict(pmlrfmodel, pmltestingclean)
+```
+
+```{r, echo=FALSE}
+#produce submission files
+pml_write_files = function(x){
+  n = length(x)
+  for(i in 1:n){
+    filename = paste0("problem_id_",i,".txt")
+    write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }
+}
+
+pml_write_files(pmltestpred)
+
+```
+
+As part of this exercise, to avoid giving the answer away, the correct answers for the real test set are hidden.  However, upon submitting each of the twenty predictions to the course's website, all twenty (100%) of the predictions proved to be correct.  In general, a 100% prediction rate would be an unrealistic expectation.  But, this exercise does demonstrate that machine learning models can be very effective at prediction, and random forests in particular are very good at classification.
+
+As it is difficult to see patterns in the data simply from the predictions.  Let's examine which variables the model found most important in constructing the random forest.
+
+```{r}
+rfimpvars <- varImp(pmlrfmodel)
+rfimpvars$varname <- rownames(rfimpvars)
+rfimpvars[rfimpvars$Overall >= 750,]
+```
+
+The top four variables are `roll_belt`, `yaw_belt`, `pitch_forearm` and `magnet_dumbbell_z`.  Let's see if we can visualize any pattern between the top two variables and the outcome.
+
+```{r, echo=FALSE}
+#Plot two most important variables
+g1 <- ggplot(pmltrainingclean, aes(x = roll_belt, y = yaw_belt, color = classe))
+g1 <- g1 + geom_point(alpha = 0.5)
+g1 <- g1 + ggtitle("Patterns of roll_belt and yaw_belt amongst classes")
+print(g1)
+```
+
+Curiously, classes D and E show an unusual swath of observations below the mean for `roll_belt`, and class E also has a number of loopy swaths of observations far above the mean for `roll_belt`.  Other than these unusual bits, most of the observations for all classes lie within three distinct groupings for `yaw_belt`.  Most of them either around the mean or near two standard deviations above.  Another small patch of mostly B's and a few E's lies far below the mean for `yaw_belt`.
+
+This is interesting, but let's check the correlation between these two variables, and compare it to the correlation between the top variable `roll_belt` and the third variable `pitch_forearm`.
+
+```{r}
+cor(pmltrainingclean$roll_belt, pmltraining$yaw_belt)
+cor(pmltrainingclean$roll_belt, pmltraining$pitch_forearm)
+```
+
+As can be seen from the graph, the top two variables, despite both being important to the model have a high correlation.  The correlation is smaller between `roll_belt` and `pitch_forearm`, though.  Let's have a look at that relationship.
+
+```{r, echo=FALSE}
+#Plot first and third most important variables
+g2 <- ggplot(pmltrainingclean, aes(x = roll_belt, y = pitch_forearm, color = classe))
+g2 <- g2 + geom_point(alpha = 0.5)
+g2 <- g2 + ggtitle("Patterns of roll_belt and pitch_forearm amongst classes")
+print(g2)
+```
+
+We still see the bifurcation of `roll_belt`, but now the E's and D's are showing wider swatches among both cohorts of `raw_belt`.  We also see the A's (the correct exercise motion) exhibit themselves almost exclusively well below the mean of `pitch_forearm`.
+
+With a good prediction model, one can see how a researcher can not only predict outcomes accurately, but gain insight into the interactions of variables.
